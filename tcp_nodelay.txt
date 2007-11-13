@@ -1,0 +1,132 @@
+TCP_NODELAY and Small Buffer Writes
+
+Being the most used transport protocol poses a fantastic challenge for TCP to
+meet many different needs.  Several heuristics were introduced over time as new
+application use cases and new hardware features appeared and as well kernel
+architecture optimizations were implemented.
+
+For instance, TCP delays sending small buffers, trying to coalesce several
+before generating a network packet. This normally is very effective, but in
+some cases we are reminded that this is indeed a heuristic.
+
+And being an heuristic, it has a place in this document, as it ends up being an
+earthquaky API, one that can have its behavior changed when underlying OS
+components change and thus should be used with great care.
+
+Applications that want lower latency for the packets to be sent will be harmed
+by this TCP heuristic. So there is a knob for applications that don't want this
+algorithm to be used. It is a socket option called TCP_NODELAY.  Applications
+can use it thru the setsockopt sockets API:
+
+	int one = 1;
+	setsockopt(descriptor, SOL_TCP, TCP_NODELAY, &one, sizeof(one));
+
+But for this to be used effectively applications must avoid doing small,
+logically related buffer writes as this will make TCP send these multiple
+buffers as individual packets, and TCP_NODELAY can interact with receiver
+optimization heuristics, such as ACK piggybacking, and result in poor overall
+performance
+
+If applications have several buffers that are logically related and that should
+be sent as one packet they will achieve better latency and performance by using
+one of the following techniques:
+
+If the buffers will be obtained from libraries or from hardware it could be
+possible to build a contiguous packet and the logical packet in one go to TCP,
+on a socket configured with TCP_NODELAY.
+
+Building an I/O vector with the logically related but not already contiguous in
+memory buffers and then passing to the kernel using writev, again on a socket
+configured with TCP_NODELAY.
+
+Then there is another, less known TCP socket option that is present in a
+similar fashion in several OS kernels and in Linux is called TCP_CORK.
+
+Setting TCP_CORK with a value of 1, aka "corking the socket", using:
+
+	int one = 1;
+	setsockopt(descriptor, SOL_TCP, TCP_CORK, &one, sizeof(one));
+
+tells TCP to wait for the application to remove the cork before sending any
+packets, just appending the buffers it receives to the socket in-kernel
+buffers.
+
+This allows applications to build a packet in kernel space, something that can
+be required when using different libraries that provides abstractions for
+layers.
+
+One example is on the SMB networking protocol, where headers are sent together
+with a data payload, and better performance is obtained if the header and
+payload is bundled in as few packets as possible.
+
+When the logical packet was built in the kernel by the various components in
+the application, something that the kernel doesn't have an easy (or possible
+at all) way to identify on behalf of the application, we just tell TCP to
+remove the cork using:
+
+	int zero = 0;
+	setsockopt(descriptor, SOL_TCP, TCP_CORK, &zero, sizeof(zero));
+
+this makes TCP send the accumulated logical packet right away, without waiting
+for any further packets from the application, something that it could do to
+fully use the network maximum packet size available.
+
+To fully understand what kind of performance impact the use of these
+techniques can have on your application we provide two simple applications[2]
+that exercises these socket options.
+
+The server just waits for packets of 30 bytes and then sends a 2 bytes packet
+in response. To start it you must tell the server TCP port and the number of
+packets it should process, 10.000 on this tests:
+
+./tcp_nodelay_server 5001 10000
+
+The server doesn't need to set any socket option, as the options discussed so
+far are applicable to the sender of small packets, and this example this is
+done on the client.
+
+The client can be used without setting any of these options, TCP_NODELAY or
+using TCP_CORK. In all cases it will send 15 two byte sized buffers and then
+wait for a response from the server.
+
+Lets now try this over the loopback interface, using the three possibilities:
+
+# Not using TCP_NODELAY nor TCP_CORK
+$ ./tcp_nodelay_client localhost 5001 10000
+10000 packets of 30 bytes sent in 400129.781250 ms: 0.749757 bytes/ms
+
+This is the baseline, when TCP coalesces writes and has to wait a bit to check
+if the application has more data that can optimally fit on a network packet.
+
+$ ./tcp_nodelay_client localhost 5001 10000 no_delay
+10000 packets of 30 bytes sent in 1649.771240 ms: 181.843399 bytes/ms using TCP_NODELAY
+
+Here TCP was told not to wait but send the buffers right away, disabling the
+algorithm that coalesces small packets. This improved performance by a huge
+factor, but caused a flurry of network packets to be sent for each logical
+packet.
+
+$ ./tcp_nodelay_client localhost 5001 10000 cork
+10000 packets of 30 bytes sent in 850.796448 ms: 352.610779 bytes/ms using TCP_CORK
+
+This halves the time needed to send the same number of logical packets,
+because TCP doesn't sends that many small packets, instead coalescing full
+logical packets in its socket buffers and then sending less network packets.
+
+As we can see, using TCP_CORK is clearly the best technique in this scenario.
+It allows the application to precisely convey the information that a logical
+packet was finished and thus must be sent without any delay. TCP long
+accumulated heuristics don't need to be used as it is not trying anymore to
+foretell what the application will do.
+
+If your application sends bulk data read from a file you may consider using
+TCP_CORK together with sendfile. Information about sendfile is available in
+the system manual pages, accessible by running:
+
+man sendfile
+
+References:
+
+[2] TCP nagle sample applications
+	http://oops.ghostprotocols.net:81/acme/tcp_nodelay_client.c 
+	http://oops.ghostprotocols.net:81/acme/tcp_nodelay_server.c 
