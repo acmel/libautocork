@@ -287,6 +287,12 @@ int ppoll(struct pollfd *fds, nfds_t nfds,
 	return libc_ppoll(fds, nfds, timeout, sigmask);
 }
 
+static void set_pending_frames(int fd)
+{
+	if (!pending_frames(fd))
+		fd_autocork_table[fd].pending_frames = 1;
+}
+
 ssize_t write(int fd, const void *buf, size_t count)
 {
 	static ssize_t (*libc_write)(int fd, const void *buf, size_t count);
@@ -294,7 +300,7 @@ ssize_t write(int fd, const void *buf, size_t count)
 	hook(write);
 
 	if (autocork_needed(fd))
-		fd_autocork_table[fd].pending_frames = 1;
+		set_pending_frames(fd);
 
 	return libc_write(fd, buf, count);
 }
@@ -306,7 +312,7 @@ ssize_t writev(int fd, const struct iovec *iov, int iovcnt)
 	hook(writev);
 
 	if (autocork_needed(fd))
-		fd_autocork_table[fd].pending_frames = 1;
+		set_pending_frames(fd);
 
 	return libc_writev(fd, iov, iovcnt);
 }
@@ -318,7 +324,7 @@ ssize_t send(int s, const void *buf, size_t len, int flags)
 	hook(send);
 
 	if (autocork_needed(s))
-		fd_autocork_table[s].pending_frames = 1;
+		set_pending_frames(s);
 
 	return libc_send(s, buf, len, flags);
 }
@@ -332,7 +338,7 @@ ssize_t sendto(int s, const void *buf, size_t len, int flags,
 	hook(sendto);
 
 	if (autocork_needed(s))
-		fd_autocork_table[s].pending_frames = 1;
+		set_pending_frames(s);
 
 	return libc_sendto(s, buf, len, flags, to, tolen);
 }
@@ -344,7 +350,7 @@ ssize_t sendmsg(int s, const struct msghdr *msg, int flags)
 	hook(sendmsg);
 
 	if (autocork_needed(s))
-		fd_autocork_table[s].pending_frames = 1;
+		set_pending_frames(s);
 
 	return libc_sendmsg(s, msg, flags);
 }
