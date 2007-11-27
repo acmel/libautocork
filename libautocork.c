@@ -33,8 +33,8 @@ static int autocork_debug = -1;
 static inline unsigned long timespec_delta_us(const struct timespec *lhs,
 					      const struct timespec *rhs)
 {
-	unsigned long sec = lhs->tv_sec - rhs->tv_sec;
-	unsigned long nsec = lhs->tv_nsec - rhs->tv_nsec;
+	long sec = lhs->tv_sec - rhs->tv_sec;
+	long nsec = lhs->tv_nsec - rhs->tv_nsec;
 
 	while (nsec >= NSEC_PER_SEC) {
 		nsec -= NSEC_PER_SEC;
