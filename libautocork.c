@@ -287,8 +287,6 @@ static inline void __push_pending_frames(int fd, const int uncorker, const char 
 		fprintf(stderr, "%s: autocorking fd %d on %s\n",
 			LIBNAME, fd, routine);
 	libc_setsockopt(fd, SOL_TCP, TCP_CORK, &value, sizeof(value));
-	value = 1;
-	libc_setsockopt(fd, SOL_TCP, TCP_CORK, &value, sizeof(value));
 
 	clock_gettime(CLOCK_MONOTONIC, &now);
 	stats__add_sample(&fd_autocork_table[fd].lat_stats,
@@ -452,8 +450,11 @@ int ppoll(struct pollfd *fds, nfds_t nfds,
 
 static void set_pending_frames(int fd, size_t len)
 {
-	if (!pending_frames(fd))
+	if (!pending_frames(fd)) {
+		int value = 1;
 		take_tstamp(fd);
+		libc_setsockopt(fd, SOL_TCP, TCP_CORK, &value, sizeof(value));
+	}
 
 	++fd_autocork_table[fd].pending_frames;
 	stats__add_sample(&fd_autocork_table[fd].pktsize_stats, len);
