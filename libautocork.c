@@ -24,15 +24,20 @@
 
 #define FD_AUTOCORK_TABLE_NR_ENTRIES 512
 
-static unsigned char fd_autocork_table[FD_AUTOCORK_TABLE_NR_ENTRIES];
+struct file {
+	unsigned char autocork:1;
+	unsigned char pending_frames:1;
+};
+
+static struct file fd_autocork_table[FD_AUTOCORK_TABLE_NR_ENTRIES];
 static int first_autocork_fd = FD_AUTOCORK_TABLE_NR_ENTRIES;
 static int last_autocork_fd;
 static int nr_autocork_fds;
 
-enum fd_flags {
-	FDFL_AUTOCORK	= 1 << 1,
-	FDFL_SENTDATA	= 1 << 2,
-};
+static inline int autocork_needed(const int fd)
+{
+	return fd_autocork_table[fd].autocork;
+}
 
 static int autocork_debug = -1;
 
@@ -84,8 +89,9 @@ int setsockopt(int s, int level, int optname, const void *optval, socklen_t optl
 		optname = TCP_CORK;
 
 		if (val != 0) {
-			if (!(fd_autocork_table[s] & FDFL_AUTOCORK)) {
-				fd_autocork_table[s] = FDFL_AUTOCORK;
+			if (!autocork_needed(s)) {
+				fd_autocork_table[s].autocork = 1;
+				fd_autocork_table[s].pending_frames = 0;
 				++nr_autocork_fds;
 
 				if (s < first_autocork_fd)
@@ -93,22 +99,23 @@ int setsockopt(int s, int level, int optname, const void *optval, socklen_t optl
 				if (s > last_autocork_fd)
 					last_autocork_fd = s;
 			}
-		} else if (fd_autocork_table[s] & FDFL_AUTOCORK) {
-			fd_autocork_table[s] = 0;
+		} else if (autocork_needed(s)) {
+			fd_autocork_table[s].autocork = 0;
+			fd_autocork_table[s].pending_frames = 0;
 			if (--nr_autocork_fds == 0) {
 				first_autocork_fd = FD_AUTOCORK_TABLE_NR_ENTRIES;
 				last_autocork_fd = 0;
 			} else if (s == first_autocork_fd) {
 				int i;
 				for (i = first_autocork_fd + 1; i <= last_autocork_fd; ++i)
-					if (fd_autocork_table[i] & FDFL_AUTOCORK) {
+					if (autocork_needed(i)) {
 						first_autocork_fd = i;
 						break;
 					}
 			} else if (s == last_autocork_fd) {
 				int i;
 				for (i = last_autocork_fd - 1; i >= first_autocork_fd; --i)
-					if (fd_autocork_table[i] & FDFL_AUTOCORK) {
+					if (autocork_needed(i)) {
 						last_autocork_fd = i;
 						break;
 					}
@@ -117,7 +124,7 @@ int setsockopt(int s, int level, int optname, const void *optval, socklen_t optl
 
 		if (autocork_debug > 0)
 			fprintf(stderr, "%s: turning TCP_CORK %s fd %d\n",
-				LIBNAME, fd_autocork_table[s] ? "ON" : "OFF", s);
+				LIBNAME, fd_autocork_table[s].autocork ? "ON" : "OFF", s);
 	}
 
 	return libc_setsockopt(s, level, optname, optval, optlen);
@@ -133,19 +140,14 @@ static inline void __push_pending_frames(int fd, const char *routine)
 	libc_setsockopt(fd, SOL_TCP, TCP_CORK, &value, sizeof(value));
 	value = 1;
 	libc_setsockopt(fd, SOL_TCP, TCP_CORK, &value, sizeof(value));
-	fd_autocork_table[fd] &= ~FDFL_SENTDATA;
+	fd_autocork_table[fd].pending_frames = 0;
 }
 
 #define push_pending_frames(fd) __push_pending_frames(fd, __func__)
 
 static inline int pending_frames(const int fd)
 {
-	return fd_autocork_table[fd] & FDFL_SENTDATA;
-}
-
-static inline int autocork_needed(const int fd)
-{
-	return fd_autocork_table[fd] & FDFL_AUTOCORK;
+	return fd_autocork_table[fd].pending_frames;
 }
 	
 ssize_t read(int fd, void *buf, size_t count)
@@ -292,7 +294,7 @@ ssize_t write(int fd, const void *buf, size_t count)
 	hook(write);
 
 	if (autocork_needed(fd))
-		fd_autocork_table[fd] |= FDFL_SENTDATA;
+		fd_autocork_table[fd].pending_frames = 1;
 
 	return libc_write(fd, buf, count);
 }
@@ -304,7 +306,7 @@ ssize_t writev(int fd, const struct iovec *iov, int iovcnt)
 	hook(writev);
 
 	if (autocork_needed(fd))
-		fd_autocork_table[fd] |= FDFL_SENTDATA;
+		fd_autocork_table[fd].pending_frames = 1;
 
 	return libc_writev(fd, iov, iovcnt);
 }
@@ -316,7 +318,7 @@ ssize_t send(int s, const void *buf, size_t len, int flags)
 	hook(send);
 
 	if (autocork_needed(s))
-		fd_autocork_table[s] |= FDFL_SENTDATA;
+		fd_autocork_table[s].pending_frames = 1;
 
 	return libc_send(s, buf, len, flags);
 }
@@ -330,7 +332,7 @@ ssize_t sendto(int s, const void *buf, size_t len, int flags,
 	hook(sendto);
 
 	if (autocork_needed(s))
-		fd_autocork_table[s] |= FDFL_SENTDATA;
+		fd_autocork_table[s].pending_frames = 1;
 
 	return libc_sendto(s, buf, len, flags, to, tolen);
 }
@@ -342,7 +344,7 @@ ssize_t sendmsg(int s, const struct msghdr *msg, int flags)
 	hook(sendmsg);
 
 	if (autocork_needed(s))
-		fd_autocork_table[s] |= FDFL_SENTDATA;
+		fd_autocork_table[s].pending_frames = 1;
 
 	return libc_sendmsg(s, msg, flags);
 }
