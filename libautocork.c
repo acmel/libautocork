@@ -11,23 +11,124 @@
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <netinet/tcp.h>
 
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/types.h>
 
 #define LIBNAME "libautocork"
 #define LIBC "libc.so.6"
 
-#define FD_AUTOCORK_TABLE_NR_ENTRIES 512
+static int autocork_debug = -1;
+
+#define NSEC_PER_SEC 1000000000L
+#define USEC_PER_SEC 1000000L
+#define NSEC_PER_USEC 1000L
+
+static inline unsigned long timespec_delta_us(const struct timespec *lhs,
+					      const struct timespec *rhs)
+{
+	unsigned long sec = lhs->tv_sec - rhs->tv_sec;
+	unsigned long nsec = lhs->tv_nsec - rhs->tv_nsec;
+
+	while (nsec >= NSEC_PER_SEC) {
+		nsec -= NSEC_PER_SEC;
+		++sec;
+	}
+	while (nsec < 0) {
+		nsec += NSEC_PER_SEC;
+		--sec;
+	}
+	return sec * USEC_PER_SEC + nsec / NSEC_PER_USEC;
+}
+
+/**
+ * ewma  -  Exponentially weighted moving average
+ * @weight: Weight to be used as damping factor, in units of 1/10
+ */
+static inline unsigned long ewma(const unsigned long avg,
+				 const unsigned long newval,
+				 const unsigned char weight)
+{
+	return avg ? (weight * avg + (10 - weight) * newval) / 10 : newval;
+}
+
+struct stats {
+	unsigned int nr_samples;
+	unsigned int avg;
+	unsigned int max;
+	unsigned int min;
+};
+
+void stats__add_sample(struct stats *self, unsigned long sample)
+{
+	if (self->nr_samples++ != 0) {
+		self->avg = ewma(self->avg, sample, 9);
+		if (sample > self->max)
+			self->max = sample;
+		if (sample < self->max)
+			self->min = sample;
+	} else
+		self->avg = self->min = self->max = sample;
+}
+
+enum uncorkers {
+	UNCORKER_poll	  = 1 << 0,
+	UNCORKER_ppoll	  = 1 << 1,
+	UNCORKER_pselect  = 1 << 2,
+	UNCORKER_read	  = 1 << 3,
+	UNCORKER_readv	  = 1 << 4,
+	UNCORKER_recv	  = 1 << 5,
+	UNCORKER_recvfrom = 1 << 6,
+	UNCORKER_recvmsg  = 1 << 7,
+	UNCORKER_select	  = 1 << 8,
+};
+
+static const char *uncorkers_str[] = {
+	"poll",
+	"ppoll",
+	"pselect",
+	"read",
+	"readv",
+	"recv",
+	"recvfrom",
+	"recvmsg",
+	"select",
+};
+
+static void fprintf_uncorkers(FILE *fp, int mask)
+{
+	int i = 0, first = 1;
+
+	while (mask != 0) {
+		if (mask & 1) {
+			if (!first)
+				fputc(',', fp);
+			else
+				first = 0;
+			fputs(uncorkers_str[i], fp);
+		}
+		++i;
+		mask >>= 1;
+	}
+}
 
 struct file {
-	unsigned char autocork:1;
-	unsigned char pending_frames:1;
+	unsigned short	pending_frames;
+	unsigned short  uncorkers;
+	unsigned char	autocork;
+	struct stats	lat_stats;
+	struct stats	pktsize_stats;
+	struct stats	qlen_stats;
+	struct timespec tstamp;
 };
+
+#define FD_AUTOCORK_TABLE_NR_ENTRIES 512
 
 static struct file fd_autocork_table[FD_AUTOCORK_TABLE_NR_ENTRIES];
 static int first_autocork_fd = FD_AUTOCORK_TABLE_NR_ENTRIES;
@@ -39,7 +140,10 @@ static inline int autocork_needed(const int fd)
 	return fd_autocork_table[fd].autocork;
 }
 
-static int autocork_debug = -1;
+static inline void take_tstamp(const int fd)
+{
+	clock_gettime(CLOCK_MONOTONIC, &fd_autocork_table[fd].tstamp);
+}
 
 void *get_symbol(char *symbol)
 {
@@ -64,6 +168,56 @@ void *get_symbol(char *symbol)
 	return sympointer;
 }
 
+static void libautocork__exit(void)
+{
+	char filename[PATH_MAX];
+	FILE *fp;
+	int fd;
+
+	snprintf(filename, sizeof(filename), "%s/libautocork.%d.debug",
+		 getenv("HOME"), getpid());
+	fp = fopen(filename, "w");
+	if (fp == NULL) {
+		fprintf(stderr, "libautocork: couldn't create %s!\n",
+			filename);
+		return;
+	}
+
+	fputs("# fd: corklat:samples avg min max qlen:avg min max pktsz:samples avg min max uncorkers\n", fp);
+
+	for (fd = 0; fd < FD_AUTOCORK_TABLE_NR_ENTRIES; ++fd) {
+		if (fd_autocork_table[fd].lat_stats.nr_samples != 0) {
+			fprintf(fp, "%d: %u %u %u %u %u %u %u %u %u %u %u ", fd,
+				fd_autocork_table[fd].lat_stats.nr_samples,
+				fd_autocork_table[fd].lat_stats.avg,
+				fd_autocork_table[fd].lat_stats.min,
+				fd_autocork_table[fd].lat_stats.max,
+				fd_autocork_table[fd].qlen_stats.avg,
+				fd_autocork_table[fd].qlen_stats.min,
+				fd_autocork_table[fd].qlen_stats.max,
+				fd_autocork_table[fd].pktsize_stats.nr_samples,
+				fd_autocork_table[fd].pktsize_stats.avg,
+				fd_autocork_table[fd].pktsize_stats.min,
+				fd_autocork_table[fd].pktsize_stats.max);
+			fprintf_uncorkers(fp, fd_autocork_table[fd].uncorkers);
+			fputc('\n', fp);
+		}
+	}
+	fclose(fp);
+}
+
+static void libautocork__init(void)
+{
+	char *s = getenv("AUTOCORK_DEBUG");
+
+	if (s == NULL)
+		autocork_debug = 0; /* No debug */
+	else
+		autocork_debug = atoi(s);
+
+	atexit(libautocork__exit);
+}
+
 #define hook(name) \
 	if (libc_##name == NULL) \
 		libc_##name = get_symbol(#name);
@@ -75,14 +229,8 @@ int setsockopt(int s, int level, int optname, const void *optval, socklen_t optl
 {
 	hook(setsockopt);
 
-	if (autocork_debug == -1) {
-		char *s = getenv("AUTOCORK_DEBUG");
-
-		if (s == NULL)
-			autocork_debug = 0; /* No debug */
-		else
-			autocork_debug = atoi(s);
-	}
+	if (autocork_debug == -1)
+		libautocork__init();
 
 	if (level == SOL_TCP && optname == TCP_NODELAY) {
 		int val = *(int *)optval;
@@ -130,9 +278,10 @@ int setsockopt(int s, int level, int optname, const void *optval, socklen_t optl
 	return libc_setsockopt(s, level, optname, optval, optlen);
 }
 
-static inline void __push_pending_frames(int fd, const char *routine)
+static inline void __push_pending_frames(int fd, const int uncorker, const char *routine)
 {
 	int value = 0;
+	struct timespec now;
 
 	if (autocork_debug > 1)
 		fprintf(stderr, "%s: autocorking fd %d on %s\n",
@@ -140,10 +289,17 @@ static inline void __push_pending_frames(int fd, const char *routine)
 	libc_setsockopt(fd, SOL_TCP, TCP_CORK, &value, sizeof(value));
 	value = 1;
 	libc_setsockopt(fd, SOL_TCP, TCP_CORK, &value, sizeof(value));
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	stats__add_sample(&fd_autocork_table[fd].lat_stats,
+			  timespec_delta_us(&now, &fd_autocork_table[fd].tstamp));
+	stats__add_sample(&fd_autocork_table[fd].qlen_stats,
+			  fd_autocork_table[fd].pending_frames);
 	fd_autocork_table[fd].pending_frames = 0;
+	fd_autocork_table[fd].uncorkers |= uncorker;
 }
 
-#define push_pending_frames(fd) __push_pending_frames(fd, __func__)
+#define push_pending_frames(fd, routine) __push_pending_frames(fd, UNCORKER_##routine, #routine)
 
 static inline int pending_frames(const int fd)
 {
@@ -157,7 +313,7 @@ ssize_t read(int fd, void *buf, size_t count)
 	hook(read);
 
 	if (pending_frames(fd))
-		push_pending_frames(fd);
+		push_pending_frames(fd, read);
 
 	return libc_read(fd, buf, count);
 }
@@ -169,7 +325,7 @@ ssize_t readv(int fd, const struct iovec *iov, int iovcnt)
 	hook(readv);
 
 	if (pending_frames(fd))
-		push_pending_frames(fd);
+		push_pending_frames(fd, readv);
 
 	return libc_readv(fd, iov, iovcnt);
 }
@@ -181,7 +337,7 @@ ssize_t recv(int s, void *buf, size_t count, int flags)
 	hook(recv);
 
 	if (pending_frames(s))
-		push_pending_frames(s);
+		push_pending_frames(s, recv);
 
 	return libc_recv(s, buf, count, flags);
 }
@@ -193,7 +349,7 @@ ssize_t recvmsg(int s, struct msghdr *msg, int flags)
 	hook(recvmsg);
 
 	if (pending_frames(s))
-		push_pending_frames(s);
+		push_pending_frames(s, recvmsg);
 
 	return libc_recvmsg(s, msg, flags);
 }
@@ -207,19 +363,23 @@ ssize_t recvfrom(int s, void *buf, size_t len, int flags,
 	hook(recvfrom);
 
 	if (pending_frames(s))
-		push_pending_frames(s);
+		push_pending_frames(s, recvfrom);
 
 	return libc_recvfrom(s, buf, len, flags, from, fromlen);
 }
 
-static inline void select_check_fds(fd_set *readfds, const char *function)
+static inline void __select_check_fds(fd_set *readfds, const int uncorker,
+				      const char *function)
 {
 	int fd;
 
 	for (fd = first_autocork_fd; fd <= last_autocork_fd; ++fd)
 		if (FD_ISSET(fd, readfds) && pending_frames(fd))
-			__push_pending_frames(fd, function);
+			__push_pending_frames(fd, uncorker, function);
 }
+
+#define select_check_fds(readfds, routine) \
+	__select_check_fds(readfds, UNCORKER_##routine, #routine)
 
 int select(int nfds, fd_set *readfds, fd_set *writefds,
 	   fd_set *exceptfds, struct timeval *timeout)
@@ -230,7 +390,7 @@ int select(int nfds, fd_set *readfds, fd_set *writefds,
 	hook(select);
 
 	if (readfds != NULL && nr_autocork_fds != 0)
-		select_check_fds(readfds, __func__);
+		select_check_fds(readfds, select);
 
 	return libc_select(nfds, readfds, writefds, exceptfds, timeout);
 }
@@ -246,19 +406,22 @@ int pselect(int nfds, fd_set *readfds, fd_set *writefds,
 	hook(pselect);
 
 	if (readfds != NULL && nr_autocork_fds != 0)
-		select_check_fds(readfds, __func__);
+		select_check_fds(readfds, pselect);
 
 	return libc_pselect(nfds, readfds, writefds, exceptfds, timeout, sigmask);
 }
 
-static inline void poll_check_fds(struct pollfd *fds, nfds_t nfds,
-				  const char *function)
+static inline void __poll_check_fds(struct pollfd *fds, nfds_t nfds,
+				    const int uncorker, const char *function)
 {
 	int i;
 	for (i = 0; i < nfds; ++i)
 		if ((fds[i].events & POLLIN) && pending_frames(fds[i].fd))
-			__push_pending_frames(fds[i].fd, function);
+			__push_pending_frames(fds[i].fd, uncorker, function);
 }
+
+#define poll_check_fds(fds, nfds, routine) \
+	__poll_check_fds(fds, nfds, UNCORKER_##routine, #routine)
 
 int poll(struct pollfd *fds, nfds_t nfds, int timeout)
 {
@@ -267,7 +430,7 @@ int poll(struct pollfd *fds, nfds_t nfds, int timeout)
 	hook(poll);
 
 	if (nr_autocork_fds != 0)
-		poll_check_fds(fds, nfds, __func__);
+		poll_check_fds(fds, nfds, poll);
 
 	return libc_poll(fds, nfds, timeout);
 }
@@ -282,15 +445,18 @@ int ppoll(struct pollfd *fds, nfds_t nfds,
 	hook(ppoll);
 
 	if (nr_autocork_fds != 0)
-		poll_check_fds(fds, nfds, __func__);
+		poll_check_fds(fds, nfds, ppoll);
 
 	return libc_ppoll(fds, nfds, timeout, sigmask);
 }
 
-static void set_pending_frames(int fd)
+static void set_pending_frames(int fd, size_t len)
 {
 	if (!pending_frames(fd))
-		fd_autocork_table[fd].pending_frames = 1;
+		take_tstamp(fd);
+
+	++fd_autocork_table[fd].pending_frames;
+	stats__add_sample(&fd_autocork_table[fd].pktsize_stats, len);
 }
 
 ssize_t write(int fd, const void *buf, size_t count)
@@ -300,9 +466,19 @@ ssize_t write(int fd, const void *buf, size_t count)
 	hook(write);
 
 	if (autocork_needed(fd))
-		set_pending_frames(fd);
+		set_pending_frames(fd, count);
 
 	return libc_write(fd, buf, count);
+}
+
+static size_t iov_totlen(const struct iovec *iov, int iovcnt)
+{
+	int i, len = 0;
+
+	for (i = 0; i < iovcnt; ++i)
+		len += iov[i].iov_len;
+
+	return len;
 }
 
 ssize_t writev(int fd, const struct iovec *iov, int iovcnt)
@@ -312,7 +488,7 @@ ssize_t writev(int fd, const struct iovec *iov, int iovcnt)
 	hook(writev);
 
 	if (autocork_needed(fd))
-		set_pending_frames(fd);
+		set_pending_frames(fd, iov_totlen(iov, iovcnt));
 
 	return libc_writev(fd, iov, iovcnt);
 }
@@ -324,7 +500,7 @@ ssize_t send(int s, const void *buf, size_t len, int flags)
 	hook(send);
 
 	if (autocork_needed(s))
-		set_pending_frames(s);
+		set_pending_frames(s, len);
 
 	return libc_send(s, buf, len, flags);
 }
@@ -338,7 +514,7 @@ ssize_t sendto(int s, const void *buf, size_t len, int flags,
 	hook(sendto);
 
 	if (autocork_needed(s))
-		set_pending_frames(s);
+		set_pending_frames(s, len);
 
 	return libc_sendto(s, buf, len, flags, to, tolen);
 }
@@ -350,7 +526,7 @@ ssize_t sendmsg(int s, const struct msghdr *msg, int flags)
 	hook(sendmsg);
 
 	if (autocork_needed(s))
-		set_pending_frames(s);
+		set_pending_frames(s, iov_totlen(msg->msg_iov, msg->msg_iovlen));
 
 	return libc_sendmsg(s, msg, flags);
 }
