@@ -73,7 +73,7 @@ void stats__add_sample(struct stats *self, unsigned long sample)
 		self->avg = ewma(self->avg, sample, 9);
 		if (sample > self->max)
 			self->max = sample;
-		if (sample < self->max)
+		if (sample < self->min)
 			self->min = sample;
 	} else
 		self->avg = self->min = self->max = sample;
