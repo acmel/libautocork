@@ -26,6 +26,8 @@
 
 static int autocork_debug = -1;
 
+static unsigned int dump_interval = 300; /* 5 minutes */
+
 #define NSEC_PER_SEC 1000000000L
 #define USEC_PER_SEC 1000000L
 #define NSEC_PER_USEC 1000L
@@ -168,22 +170,9 @@ void *get_symbol(char *symbol)
 	return sympointer;
 }
 
-static void libautocork__exit(void)
+static void libautocork__fprintf_stats(FILE *fp)
 {
-	char filename[PATH_MAX];
-	FILE *fp;
 	int fd;
-
-	snprintf(filename, sizeof(filename), "%s/libautocork.%d.debug",
-		 getenv("HOME"), getpid());
-	fp = fopen(filename, "w");
-	if (fp == NULL) {
-		fprintf(stderr, "libautocork: couldn't create %s!\n",
-			filename);
-		return;
-	}
-
-	fputs("# fd: corklat:samples avg min max qlen:avg min max pktsz:samples avg min max uncorkers\n", fp);
 
 	for (fd = 0; fd < FD_AUTOCORK_TABLE_NR_ENTRIES; ++fd) {
 		if (fd_autocork_table[fd].lat_stats.nr_samples != 0) {
@@ -203,17 +192,40 @@ static void libautocork__exit(void)
 			fputc('\n', fp);
 		}
 	}
-	fclose(fp);
+	fflush(fp);
+}
+
+static FILE *dump_fp;
+
+static void libautocork__exit(void)
+{
+	if (dump_fp != NULL) {
+		libautocork__fprintf_stats(dump_fp);
+		fclose(dump_fp);
+	}
 }
 
 static void libautocork__init(void)
 {
 	char *s = getenv("AUTOCORK_DEBUG");
 
-	if (s == NULL)
-		autocork_debug = 0; /* No debug */
-	else
+	autocork_debug = 0; /* No debug */
+	if (s != NULL)
 		autocork_debug = atoi(s);
+
+	s = getenv("AUTOCORK_DUMP_INTERVAL");
+	if (s != NULL)
+		dump_interval = atoi(s);
+
+	if (dump_interval != 0) {
+		char filename[PATH_MAX];
+
+		snprintf(filename, sizeof(filename), "%s/libautocork.%d.debug",
+			 getenv("HOME"), getpid());
+		dump_fp = fopen(filename, "w");
+		if (dump_fp != NULL)
+			fputs("# fd: corklat:samples avg min max qlen:avg min max pktsz:samples avg min max uncorkers\n", dump_fp);
+	}
 
 	atexit(libautocork__exit);
 }
@@ -281,20 +293,30 @@ int setsockopt(int s, int level, int optname, const void *optval, socklen_t optl
 static inline void __push_pending_frames(int fd, const int uncorker, const char *routine)
 {
 	int value = 0;
-	struct timespec now;
 
 	if (autocork_debug > 1)
 		fprintf(stderr, "%s: autocorking fd %d on %s\n",
 			LIBNAME, fd, routine);
 	libc_setsockopt(fd, SOL_TCP, TCP_CORK, &value, sizeof(value));
 
-	clock_gettime(CLOCK_MONOTONIC, &now);
-	stats__add_sample(&fd_autocork_table[fd].lat_stats,
-			  timespec_delta_us(&now, &fd_autocork_table[fd].tstamp));
-	stats__add_sample(&fd_autocork_table[fd].qlen_stats,
-			  fd_autocork_table[fd].pending_frames);
+	if (dump_interval != 0) {
+		struct timespec now;
+		static struct timespec last_stat_dump;
+
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		stats__add_sample(&fd_autocork_table[fd].lat_stats,
+				  timespec_delta_us(&now, &fd_autocork_table[fd].tstamp));
+		stats__add_sample(&fd_autocork_table[fd].qlen_stats,
+				  fd_autocork_table[fd].pending_frames);
+		fd_autocork_table[fd].uncorkers |= uncorker;
+
+		if (now.tv_sec - last_stat_dump.tv_sec > dump_interval) {
+			libautocork__fprintf_stats(dump_fp);
+			last_stat_dump = now;
+		}
+	}
+
 	fd_autocork_table[fd].pending_frames = 0;
-	fd_autocork_table[fd].uncorkers |= uncorker;
 }
 
 #define push_pending_frames(fd, routine) __push_pending_frames(fd, UNCORKER_##routine, #routine)
