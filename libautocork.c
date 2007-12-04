@@ -26,6 +26,9 @@
 
 static int autocork_debug = -1;
 
+/* If non-zero says how many app buffers can be autocorked */
+static int autocork_max_qlen;
+
 static unsigned int dump_interval = 300; /* 5 minutes */
 
 #define NSEC_PER_SEC 1000000000L
@@ -89,6 +92,7 @@ enum uncorkers {
 	UNCORKER_recvfrom = 1 << 6,
 	UNCORKER_recvmsg  = 1 << 7,
 	UNCORKER_select	  = 1 << 8,
+	UNCORKER_check_qlen  = 1 << 9,
 };
 
 static const char *uncorkers_str[] = {
@@ -101,6 +105,7 @@ static const char *uncorkers_str[] = {
 	"recvfrom",
 	"recvmsg",
 	"select",
+	"check_qlen",
 };
 
 static void fprintf_uncorkers(FILE *fp, int mask)
@@ -189,7 +194,7 @@ static void libautocork__fprintf_stats(FILE *fp)
 				fd_autocork_table[fd].pktsize_stats.min,
 				fd_autocork_table[fd].pktsize_stats.max);
 			fprintf_uncorkers(fp, fd_autocork_table[fd].uncorkers);
-			fputc('\n', fp);
+			fprintf(fp, " %d\n", autocork_max_qlen);
 		}
 	}
 	fflush(fp);
@@ -217,6 +222,10 @@ static void libautocork__init(void)
 	if (s != NULL)
 		dump_interval = atoi(s);
 
+	s = getenv("AUTOCORK_MAX_QLEN");
+	if (s != NULL)
+		autocork_max_qlen = atoi(s);
+
 	if (dump_interval != 0) {
 		char filename[PATH_MAX];
 
@@ -224,7 +233,7 @@ static void libautocork__init(void)
 			 getenv("HOME"), getpid());
 		dump_fp = fopen(filename, "w");
 		if (dump_fp != NULL)
-			fputs("# fd: corklat:samples avg min max qlen:avg min max pktsz:samples avg min max uncorkers\n", dump_fp);
+			fputs("# fd: corklat:samples avg min max qlen:avg min max pktsz:samples avg min max uncorkers envmaxqlen\n", dump_fp);
 	}
 
 	atexit(libautocork__exit);
@@ -482,16 +491,27 @@ static void set_pending_frames(int fd, size_t len)
 	stats__add_sample(&fd_autocork_table[fd].pktsize_stats, len);
 }
 
+static void check_qlen(int fd)
+{
+	if (autocork_max_qlen != 0 &&
+	    autocork_needed(fd) &&
+	    fd_autocork_table[fd].pending_frames >= autocork_max_qlen)
+		push_pending_frames(fd, check_qlen);
+}
+
 ssize_t write(int fd, const void *buf, size_t count)
 {
 	static ssize_t (*libc_write)(int fd, const void *buf, size_t count);
+	ssize_t rc;
 
 	hook(write);
 
 	if (autocork_needed(fd))
 		set_pending_frames(fd, count);
 
-	return libc_write(fd, buf, count);
+	rc = libc_write(fd, buf, count);
+	check_qlen(fd);
+	return rc;
 }
 
 static size_t iov_totlen(const struct iovec *iov, int iovcnt)
@@ -507,25 +527,31 @@ static size_t iov_totlen(const struct iovec *iov, int iovcnt)
 ssize_t writev(int fd, const struct iovec *iov, int iovcnt)
 {
 	static ssize_t (*libc_writev)(int fd, const struct iovec *iov, int iovcnt);
+	ssize_t rc;
 
 	hook(writev);
 
 	if (autocork_needed(fd))
 		set_pending_frames(fd, iov_totlen(iov, iovcnt));
 
-	return libc_writev(fd, iov, iovcnt);
+	rc = libc_writev(fd, iov, iovcnt);
+	check_qlen(fd);
+	return rc;
 }
 
 ssize_t send(int s, const void *buf, size_t len, int flags)
 {
 	static ssize_t (*libc_send)(int s, const void *buf, size_t len, int flags);
+	ssize_t rc;
 
 	hook(send);
 
 	if (autocork_needed(s))
 		set_pending_frames(s, len);
 
-	return libc_send(s, buf, len, flags);
+	rc = libc_send(s, buf, len, flags);
+	check_qlen(s);
+	return rc;
 }
 
 ssize_t sendto(int s, const void *buf, size_t len, int flags,
@@ -533,23 +559,29 @@ ssize_t sendto(int s, const void *buf, size_t len, int flags,
 {
 	static ssize_t (*libc_sendto)(int s, const void *buf, size_t len, int flags,
 				      const struct sockaddr *to, socklen_t tolen);
+	ssize_t rc;
 
 	hook(sendto);
 
 	if (autocork_needed(s))
 		set_pending_frames(s, len);
 
-	return libc_sendto(s, buf, len, flags, to, tolen);
+	rc = libc_sendto(s, buf, len, flags, to, tolen);
+	check_qlen(s);
+	return rc;
 }
 
 ssize_t sendmsg(int s, const struct msghdr *msg, int flags)
 {
 	static ssize_t (*libc_sendmsg)(int s, const struct msghdr *msg, int flags);
+	ssize_t rc;
 
 	hook(sendmsg);
 
 	if (autocork_needed(s))
 		set_pending_frames(s, iov_totlen(msg->msg_iov, msg->msg_iovlen));
 
-	return libc_sendmsg(s, msg, flags);
+	rc = libc_sendmsg(s, msg, flags);
+	check_qlen(s);
+	return rc;
 }
