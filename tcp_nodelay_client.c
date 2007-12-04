@@ -50,11 +50,11 @@ static const char *port = DEFAULT_PORT;
 
 #define NSEC_PER_SEC 1000000000L
 
-static long timespec_delta(const struct timespec *large,
+static int64_t timespec_delta(const struct timespec *large,
                            const struct timespec *small)
 {
         time_t secs = large->tv_sec - small->tv_sec;
-        long nsecs = large->tv_nsec - small->tv_nsec;
+        int64_t nsecs = large->tv_nsec - small->tv_nsec;
 
         if (nsecs < 0) {
                 secs--;
