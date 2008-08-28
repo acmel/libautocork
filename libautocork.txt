@@ -1,0 +1,138 @@
+Build Instructions:
+
+[acme@doppio ~]$ git-clone git://git.kernel.org/pub/scm/linux/kernel/git/acme/libautocork
+[acme@doppio ~]$ cd libautocork/
+[acme@doppio libautocork]$ make
+gcc -O2 -g -Wall -fPIC   -c -o libautocork.o libautocork.c
+gcc -O2 -g -Wall -fPIC -shared -o libautocork.so libautocork.o -ldl
+gcc -O2 -g -Wall -fPIC tcp_nodelay_client.c -o tcp_nodelay_client -lrt
+gcc -O2 -g -Wall -fPIC tcp_nodelay_server.c -o tcp_nodelay_server
+[acme@doppio libautocork]$
+	
+	To use it:
+
+LD_PRELOAD=./libautocork.o your_application
+
+	Using it with the test application in this tarball:
+
+1. start the server:
+
+[acme@doppio libautocork]$ ./tcp_nodelay_server 5001 10000
+server: waiting for connection
+
+2. start the client without using libautocork and using nodelay:
+
+[acme@doppio libautocork]$ ./tcp_nodelay_client --verbose --no_delay localhost
+10000 packets (15 buffers) sent in 1776.608398 ms: 168.861069 bytes/ms using TCP_NODELAY
+
+3. Now lets try using libautocork with the same parameters used, i.e.
+   reproducing an application that uses TCP_NODELAY and will have it
+   turned into TCP_CORK by libautocork:
+
+[acme@doppio libautocork]$ LD_PRELOAD=./libautocork.so ./tcp_nodelay_client --verbose --no_delay localhost
+10000 packets (15 buffers) sent in 481.941132 ms: 622.482666 bytes/ms using TCP_NODELAY
+
+It is important to use './' or the full path, as the linux library
+loader will try to find it on the LD_LIBRARY_PATH list of paths or in
+what is in /etc/ld.so.conf, and as the current directory ('.') normally
+isn't you could get something confusing as:
+
+[acme@doppio libautocork]$ LD_PRELOAD=libautocork.so ./tcp_nodelay_client --verbose --no_delay localhost
+ERROR: ld.so: object 'libautocork.so' from LD_PRELOAD cannot be preloaded: ignored.
+10000 packets (15 buffers) sent in 1780.601074 ms: 168.482437 bytes/ms using TCP_NODELAY
+[acme@doppio libautocork]$ 
+
+So using libautocork on a unmodified binary that uses TCP_NODELAY and
+sends 15 buffers and then wait for one buffer we get througput from
+168.861069 bytes/ms up to 622.482666 bytes/ms for 10000 packets.
+
+The test case can be used to do lots of other tests with TCP_CORK,
+TCP_NODELAY, sending packets built entirely in userspace (1 buffer), a
+header + a payload (2 buffers), etc:
+
+[acme@doppio libautocork]$ ./tcp_nodelay_client --help
+Usage: tcp_nodelay_client [OPTION...] [SERVER]
+
+  -c, --cork                 use TCP_CORK
+  -H, --header_plus_payload  send logical packets header + payload
+  -n, --no_delay             use TCP_NODELAY
+  -N, --nr_logical_packets=NR   send NR logical packets [DEFAULT=10000]
+  -p, --port=PORT            connect to PORT [DEFAULT=5001]
+  -s, --single_request       send logical packets as a single request
+  -v, --verbose              be verbose
+  -?, --help                 Give this help list
+      --usage                Give a short usage message
+
+Mandatory or optional arguments to long options are also mandatory or
+optional for any corresponding short options.
+[acme@doppio libautocork]$
+
+The server also helps understanding what really happens in terms of
+number of times the read syscall returns with partial buffers, for
+instance, for the above sessions:
+
+[acme@doppio libautocork]$ ./tcp_nodelay_server 5001 10000
+server: waiting for connection
+server: accept from localhost.localdomain
+server: received 119281 buffers
+server: waiting for connection
+server: accept from localhost.localdomain
+server: received 10000 buffers
+server: waiting for connection
+server: accept from localhost.localdomain
+server: received 121347 buffers
+server: waiting for connection
+
+The second one was the one with libautocork, so instead of receiving 120
+thousand buffers (the number of real network packets is about the same)
+it received 10000 buffers (that is exactly the number of networking
+packets sans connection establishment and teardown) , the number of
+logical packets sent.
+
+To make sure that libautocork is being used you can take a look at the
+process shared memory library map:
+
+[acme@doppio libautocork]$ /sbin/pidof tcp_nodelay_server
+19091
+[acme@doppio libautocork]$ grep libautocork.so /proc/19091/smaps
+2aaaaaaad000-2aaaaaaaf000 r-xp 00000000 fd:00 197010 /home/acme/libautocork/libautocork.so
+2aaaaaaaf000-2aaaaacaf000 ---p 00002000 fd:00 197010 /home/acme/libautocork/libautocork.so
+2aaaaacaf000-2aaaaacb0000 rw-p 00002000 fd:00 197010 /home/acme/libautocork/libautocork.so
+[acme@doppio libautocork]$
+
+You can also use an environment variable:
+
+[acme@doppio libautocork]$ export AUTOCORK_DEBUG=1
+[acme@doppio libautocork]$ LD_PRELOAD=./libautocork.so ./tcp_nodelay_client --verbose --no_delay localhost
+libautocork: turning TCP_CORK ON fd 3
+10000 packets (15 buffers) sent in 491.302338 ms: 610.621948 bytes/ms using TCP_NODELAY
+[acme@doppio libautocork]$
+
+Use a value of 2 to get more verbose output, such as when libautocork
+pushes pending frames, aka autocorks:
+
+[acme@doppio libautocork]$ export AUTOCORK_DEBUG=2
+[acme@doppio libautocork]$ LD_PRELOAD=./libautocork.so
+./tcp_nodelay_client --verbose --no_delay localhost 2>&1 | head -10
+libautocork: turning TCP_CORK ON fd 3
+libautocork: autocorking fd 3 on read
+libautocork: autocorking fd 3 on read
+libautocork: autocorking fd 3 on read
+libautocork: autocorking fd 3 on read
+libautocork: autocorking fd 3 on read
+libautocork: autocorking fd 3 on read
+libautocork: autocorking fd 3 on read
+libautocork: autocorking fd 3 on read
+libautocork: autocorking fd 3 on read
+[acme@doppio libautocork]$
+
+The autocorking is made on one of the following standard C library calls:
+
+read, readv, recv, recvmsg, recvfrom, select, pselect, poll and ppoll
+
+But only when data was sent on an file descriptor where
+setsockopt(TCP_NODELAY) was done.
+
+TODO: work on the cheapest possible timer to use to avoid having the socket
+autocorked when the application doesn't use one of the library calls that
+pushes the data.
