@@ -13,6 +13,7 @@
 #include <errno.h>
 #include <string.h>
 #include <netdb.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -22,11 +23,27 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 
-#define NR_DATA_ENTRIES 15
+#define NR_DATA_ENTRIES 100
 #define SIZE_DATA_ENTRY 2
 #define SIZE_RESPONSE 2
 
 int buffers_received;
+int rate;
+
+#define NSEC_PER_SEC 1000000000L
+
+static int64_t timespec_delta(const struct timespec *large,
+                           const struct timespec *small)
+{
+        time_t secs = large->tv_sec - small->tv_sec;
+        int64_t nsecs = large->tv_nsec - small->tv_nsec;
+
+        if (nsecs < 0) {
+                secs--;
+                nsecs += NSEC_PER_SEC;
+        }
+        return secs * NSEC_PER_SEC + nsecs;
+}
 
 static void tcp_nodelay(int fd)
 {
@@ -80,7 +97,7 @@ static int exchange_packet(int fd, const int cork)
 	if (cork)
 		tcp_cork(fd);
 
-	if (write(fd, response, SIZE_RESPONSE) != SIZE_RESPONSE) {
+	if (!rate && write(fd, response, SIZE_RESPONSE) != SIZE_RESPONSE) {
 		fprintf(stderr, "server: write failed!\n");
 		return -1;
 	}
@@ -93,6 +110,7 @@ static int exchange_packet(int fd, const int cork)
 
 int main(int argc, char **argv)
 {
+	uint64_t max = 0, min = 3600 * NSEC_PER_SEC, avg = 0;
 	struct addrinfo *host;
 	struct addrinfo hints = {
 		.ai_family   = AF_INET,
@@ -108,9 +126,10 @@ int main(int argc, char **argv)
 		goto out;
 	}
 
-	if (argc > 3) {
-		cork = strcmp(argv[4], "cork") == 0;
-		no_delay = strcmp(argv[4], "no_delay") == 0;
+	if (argc > 2) {
+		cork = strcmp(argv[2], "cork") == 0;
+		no_delay = strcmp(argv[2], "no_delay") == 0;
+		rate = strcmp(argv[2], "rate") == 0;
 	}
 
 	port = argv[1];
@@ -137,6 +156,8 @@ int main(int argc, char **argv)
 	listen(fd, 1);
 	while (1) {
 		char peer[1024];
+		uint64_t delta;
+		struct timespec start, finish;
 
 		puts("server: waiting for connection");
 
@@ -159,8 +180,39 @@ int main(int argc, char **argv)
 		if (no_delay)
 			tcp_nodelay(client);
 
-		while (exchange_packet(client, cork) == 0);
-		printf("server: received %d buffers\n", buffers_received);
+		clock_gettime(CLOCK_MONOTONIC, &start);
+		if (rate) {
+			struct timespec packet_start, packet_finish;
+
+			packet_start = start;
+			for (;;) {
+				if (exchange_packet(client, cork) != 0)
+					break;
+				clock_gettime(CLOCK_MONOTONIC, &packet_finish);
+				delta = timespec_delta(&packet_finish, &packet_start);
+				if (delta > max)
+					max = delta;
+				if (delta < min)
+					min = delta;
+				if (avg == 0)
+					avg = delta;
+				else
+					avg = (avg + delta) / 2;
+				packet_start = packet_finish;
+			}
+			finish = packet_finish;
+			printf("server: min=%lldns, max=%lldns, avg=%lldns\n",
+			       (unsigned long long)min,
+			       (unsigned long long)max,
+			       (unsigned long long)avg);
+		} else {
+			while (exchange_packet(client, cork) == 0);
+			clock_gettime(CLOCK_MONOTONIC, &finish);
+		}
+		delta = timespec_delta(&finish, &start);
+		printf("server: received %d buffers, avg ipi: %lldns\n",
+		       buffers_received,
+		       (unsigned long long)(delta / buffers_received));
 		buffers_received = 0;
 
 		close(client);

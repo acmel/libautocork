@@ -21,6 +21,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <poll.h>
+#include <stdlib.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -40,6 +41,8 @@ static int use_header_plus_payload;
 
 static int nr_logical_packets = DEFAULT_NR_LOGICAL_PACKETS;
 static const char *port = DEFAULT_PORT;
+static unsigned int rate;
+static uint64_t interval;
 
 #define __stringify_1(x) #x
 #define __stringify(x) __stringify_1(x)
@@ -63,7 +66,16 @@ static int64_t timespec_delta(const struct timespec *large,
         return secs * NSEC_PER_SEC + nsecs;
 }
 
-#define NR_DATA_ENTRIES 15
+static void timespec_add(struct timespec *t, const uint64_t nsecs)
+{
+	t->tv_nsec += nsecs;
+	while (t->tv_nsec >= NSEC_PER_SEC) {
+		t->tv_sec++;
+		t->tv_nsec -= NSEC_PER_SEC;
+	}
+}
+
+#define NR_DATA_ENTRIES 100
 #define SIZE_DATA_ENTRY 2
 #define SIZE_RESPONSE 2
 
@@ -110,10 +122,9 @@ static void nread(int fd, char *bf, int len)
 	} while (len != 0);
 }
 
-static void exchange_packet(int fd)
+static void send_packet(int fd)
 {
 	int i;
-	char response[SIZE_RESPONSE];
 
 	if (use_cork)
 		tcp_cork(fd);
@@ -143,7 +154,13 @@ static void exchange_packet(int fd)
 
 	if (use_cork)
 		tcp_uncork(fd);
+}
 
+static void exchange_packet(int fd)
+{
+	char response[SIZE_RESPONSE];
+
+	send_packet(fd);
 	nread(fd, response, SIZE_RESPONSE);
 }
 
@@ -163,6 +180,12 @@ static const struct argp_option client_options[] = {
 		.name = "port",
 		.arg  = "PORT",
 		.doc  = "connect to PORT [DEFAULT=" DEFAULT_PORT "]",
+	},
+	{
+		.key  = 'r',
+		.name = "rate",
+		.arg  = "RATE",
+		.doc  = "Send RATE packets per second [DEFAULT=Don't rate limit]",
 	},
 	{
 		.key  = 'H',
@@ -198,6 +221,8 @@ static error_t client_options_parser(int key, char *arg __unused,
 	case 'H': use_header_plus_payload = 1;		break;
 	case 'n': use_no_delay = 1;			break;
 	case 'p': port = arg;				break;
+	case 'r': rate = atoi(arg);
+		  interval = NSEC_PER_SEC / rate;	break;
 	case 's': use_single_request = 1;		break;
 	case 'v': verbose = 1;				break;
 	case 'N': nr_logical_packets = atoi(arg);	break;
@@ -216,9 +241,9 @@ static struct argp client_argp = {
 
 int main(int argc, char *argv[])
 {
-	struct timespec start, finish;
+	struct timespec start, finish, next, left;
 	float delta;
-	float rate;
+	float total_rate;
 	struct addrinfo *host;
 	struct addrinfo hints = {
 		.ai_family   = AF_INET,
@@ -263,21 +288,37 @@ int main(int argc, char *argv[])
 		tcp_nodelay(fd);
 
 	i = nr_logical_packets;
-	while (i--)
-		exchange_packet(fd);
+	printf("rate: %d packets/s\n", rate);
+	printf("interval: %lldns\n", (unsigned long long)interval);
+	if (interval != 0) {
+		next = start;
+		timespec_add(&next, interval);
+		while (i--) {
+			send_packet(fd);
+			if (clock_nanosleep(CLOCK_MONOTONIC,
+					    TIMER_ABSTIME,
+					    &next, &left) != 0) {
+				printf("couldn't achieve a rate of %d packets/s!\n", rate);
+				break;
+			}
+			timespec_add(&next, interval);
+		}
+	} else
+		while (i--)
+			exchange_packet(fd);
 
 	clock_gettime(CLOCK_MONOTONIC, &finish);
 	delta = timespec_delta(&finish, &start) / 1000000.0;
 
-	rate = (nr_logical_packets * NR_DATA_ENTRIES * SIZE_DATA_ENTRY) / delta;
+	total_rate = (nr_logical_packets * NR_DATA_ENTRIES * SIZE_DATA_ENTRY) / delta;
 
 	if (verbose)
 		printf("%d packets (%s) sent in %f ms: ",
 		      nr_logical_packets,
 		      use_header_plus_payload ? "2 buffers" :
-		      use_single_request ? "1 buffer" : "15 buffers", delta);
+		      use_single_request ? "1 buffer" : "100 buffers", delta);
 
-	printf("%f", rate);
+	printf("%f", total_rate);
 	
 	if (verbose)
 		printf(" bytes/ms %s",
